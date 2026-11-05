@@ -2,16 +2,20 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { N } from "../src/grid.js";
 import {
+  BREAK_FADE,
+  BREAK_WARP,
   GATHER_MAX,
   HOLD,
   RAMP,
   RELEASE,
   STABLE,
   WARP,
+  advanceBreak,
   advanceLetter,
   blendMould,
   blobDistance,
   blobRadius,
+  breakView,
   dilate,
   distanceOutside,
   findHoles,
@@ -21,10 +25,12 @@ import {
   labelOil,
   letterView,
   maskToField,
+  newBreakClock,
   newLetterClock,
   releaseField,
   signedDistance,
   smooth,
+  splitField,
   wheelCells,
 } from "../src/glyph.js";
 
@@ -287,4 +293,65 @@ test("a glyph mask is built bottom-row-first so letters are upright in the GL vi
   const { sdf } = maskToField(m);
   assert.ok(sdf[(N - 20) * N + 128] < 0, "inside the shape near the top rows");
   assert.ok(sdf[20 * N + 128] > 0, "outside near the bottom rows");
+});
+
+test("break-up clock warps, lets go, then is done", () => {
+  const c = newBreakClock();
+  assert.equal(breakView(c).phase, "warp");
+  near(breakView(c).s, 0);
+  let t = 0;
+  let last = 0;
+  while (c.phase === "warp") {
+    advanceBreak(c, 0.05);
+    t += 0.05;
+    const v = breakView(c);
+    if (c.phase === "warp") assert.ok(v.s >= last - 1e-9, "morph never runs backwards");
+    if (c.phase === "warp") last = v.s;
+    assert.ok(t < BREAK_WARP + 0.2);
+  }
+  assert.equal(c.phase, "fade");
+  near(breakView(c).s, 1);
+  near(breakView(c).env, 1);
+  let prev = 1;
+  while (c.phase === "fade") {
+    advanceBreak(c, 0.05);
+    const v = breakView(c);
+    if (c.phase === "fade") {
+      assert.ok(v.env <= prev + 1e-9, "pull only fades");
+      prev = v.env;
+    }
+  }
+  assert.ok(breakView(c).done);
+  near(breakView(c).env, 0);
+  assert.ok(BREAK_FADE > 0);
+});
+
+test("splitField cuts one mass into 3-5 separate lumps with the same area", () => {
+  // One big round blob of oil.
+  const mask = new Float32Array(N * N);
+  for (let y = 0; y < N; y += 1) {
+    for (let x = 0; x < N; x += 1) if (Math.hypot(x + 0.5 - N / 2, y + 0.5 - N / 2) < 70) mask[y * N + x] = 1;
+  }
+  const area = mask.reduce((a, b) => a + b, 0);
+  for (let seed = 1; seed <= 8; seed += 1) {
+    const { field, count, discs } = splitField(mask, lcg(seed));
+    assert.ok(count >= 3 && count <= 5);
+    assert.equal(discs.length, count);
+    let inside = 0;
+    for (const v of field) if (v < 0) inside += 1;
+    assert.ok(Math.abs(inside - area) / area < 0.08, `area ${inside} vs ${area}`);
+    for (let a = 0; a < discs.length; a += 1) {
+      for (let b = a + 1; b < discs.length; b += 1) {
+        const d = Math.hypot(discs[a].x - discs[b].x, discs[a].y - discs[b].y) - discs[a].r - discs[b].r;
+        assert.ok(d > 0, "lumps are separate");
+      }
+    }
+    // Lumps are formed where the oil already is, not far off at the glass edge.
+    for (const c of discs) assert.ok(Math.hypot(c.x - N / 2, c.y - N / 2) < 85);
+  }
+});
+
+test("splitField falls back to a random release when there is hardly any oil", () => {
+  const r = splitField(new Float32Array(N * N), lcg(3));
+  assert.ok(r.count >= 3 && r.field.length === N * N);
 });

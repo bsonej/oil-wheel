@@ -31,7 +31,7 @@ Needs a browser with WebGL2 and float render targets (`EXT_color_buffer_float`):
 | Fullscreen (`Enter`), Hide controls (`Esc`) | For using it as a display. |
 | Letters (`A` to `Z`) | The second oil flows together into one blob, the blob flows into that letter, it is held for 3 seconds, then the letter flows apart into a random 1 to 4 blobs that drift off. Pressing another letter mid-way melts the current one back into a blob and flows into the new letter. Keys with Ctrl, Cmd or Alt are ignored. |
 
-From the console, `oilWheel.cfg` holds the simulation constants, `oilWheel.formLetter("R")` triggers a letter, and `oilWheel.stats()` reports each active layer's oil fraction (and, while a letter is up, how much of the letter the oil covers).
+From the console, `oilWheel.cfg` holds the simulation constants, `oilWheel.formLetter("R")` triggers a letter, `oilWheel.breakUp(0)` breaks a layer back into lumps, and `oilWheel.stats()` reports each active layer's oil fraction (and, while a letter is up, how much of the letter the oil covers).
 
 ## How it works
 
@@ -49,6 +49,7 @@ Everything is in `src/oilwheel.js`, on the GPU, one simulation per layer at 256Ã
   4. **Release.** The outline is blended from the letter into a random 1 to 4 round blobs holding the same amount of oil, then the push fades and stirring is boosted so they drift apart.
 
   Only the unified mass may grow or shrink, and only by a little (a volume regulator holds it to the mould's size). Pushing oil across the whole wheel is a very large-scale flow, so while a letter is up that layer gets a stiffer pressure solve (more iterations and almost no damping); with the normal one the flow stays slightly compressible and the oil visibly drains away.
+- **Break-ups.** Left alone, oil slowly coarsens until each colour is one piece. Every second or so the engine looks at one layer; if it has had two big pieces or fewer for a random 15 to 40 seconds, it is broken back up with the same mould used for letters. The mould blends from the oil's current outline into 3 to 5 round lumps placed inside it (the mass is split into regions around spread-out points, with clear carrier between lumps), the push stays on a moment while the necks pinch off, then fades with a stir boost so the lumps drift apart. Nothing is created or removed. Tune with `oilWheel.cfg.breakPieces`, `breakMin`, `breakMax`, `breakWarp`, or force one with `oilWheel.breakUp(layer)`. A letter key press overrides a break-up in progress.
 - **Frame-rate independence.** Per-step strengths are tuned at about 43 fps and scaled by frame time, so a slow GPU moves the same oil per second.
 
 ## Layout

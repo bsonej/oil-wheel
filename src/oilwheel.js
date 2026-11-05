@@ -13,19 +13,25 @@
 
 import { N } from "./grid.js";
 import {
+  BREAK_WARP,
   WARP,
+  advanceBreak,
   advanceLetter,
   blendMould,
   blobDistance,
   blobRadius,
+  breakView,
   buildGlyphData,
   dilate,
   findHoles,
   isLetterKey,
   labelOil,
   letterView,
+  newBreakClock,
   newLetterClock,
   releaseField,
+  signedDistance,
+  splitField,
   wheelCells,
 } from "./glyph.js";
 
@@ -461,6 +467,10 @@ export function startOilWheel(canvas, options = {}) {
     pull: 1,
     warp: WARP, // seconds for the single blob to flow into the letter
     fill: 0.12, // how fast gaps inside the unified mass close, per frame
+    breakWarp: BREAK_WARP, // seconds for a coarsened layer to flow apart into fresh pieces
+    breakPieces: 2, // a layer with this few big pieces or fewer is due a break-up...
+    breakMin: 15, // ...after waiting a random time between these many seconds
+    breakMax: 40,
     analyseEvery: 8, // frames between looks at the oil (one mass? any gaps?)
     rot: 0.1,
     exposure: 1.0,
@@ -629,6 +639,9 @@ export function startOilWheel(canvas, options = {}) {
 
   // Letters only act on the second layer; the other layers keep drifting untouched.
   const LETTER_LAYER = 1;
+  // The mould acts on one layer at a time: the letter layer during a letter, or whichever layer is
+  // being broken back up.
+  const mouldLayer = () => (state.letter ? state.letter.layer : -1);
   const blankIcon = iconTexture(new Float32Array(4), 1);
   const glyphCache = new Map();
   const cells = wheelCells();
@@ -747,11 +760,99 @@ export function startOilWheel(canvas, options = {}) {
     L.morph = -1;
   }
 
+  // How many big pieces of oil a layer has right now (specks do not count).
+  const BIG_PIECE = 120; // cells
+  function countPieces(buf) {
+    for (let i = 0; i < N * N; i += 1) phiScratch[i] = buf[i * 4];
+    return labelOil(phiScratch, insideMask, BIG_PIECE).big;
+  }
+
+  // Break a layer's oil back apart: its current outline flows into a fresh random pattern made the
+  // same way as the opening pour, then the pull lets go and the pieces carry on by themselves.
+  function startBreakUp(index) {
+    if (state.letter || index < 0 || index >= activeSims().length) return false;
+    const sim = sims[index];
+    const buf = readPhi(sim);
+    // The oil as it is now, in the view frame (the frame the mould lives in).
+    const c = Math.cos(state.theta);
+    const sn = Math.sin(state.theta);
+    const nowMask = new Float32Array(N * N);
+    let oilCells = 0;
+    for (let vy = 0; vy < N; vy += 1) {
+      for (let vx = 0; vx < N; vx += 1) {
+        const dx = vx + 0.5 - N / 2;
+        const dy = vy + 0.5 - N / 2;
+        const wx = Math.floor(c * dx + sn * dy + N / 2);
+        const wy = Math.floor(-sn * dx + c * dy + N / 2);
+        if (wx < 0 || wy < 0 || wx >= N || wy >= N) continue;
+        const w = wy * N + wx;
+        if (buf[w * 4 + 2] > 0.5 && buf[w * 4] > 0) {
+          nowMask[vy * N + vx] = 1;
+          oilCells += 1;
+        }
+      }
+    }
+    const base = sim.base * cells.length;
+    const area = oilCells ? Math.max(0.85 * base, Math.min(1.15 * base, oilCells)) : base;
+    const split = splitField(nowMask, Math.random);
+    state.letter = {
+      kind: "break",
+      layer: index,
+      from: signedDistance(nowMask),
+      to: split.field,
+      area,
+      clock: newBreakClock(),
+      phase: "warp",
+      morph: -1,
+    };
+    sim.restoring = false;
+    sim.restore = 0;
+    updateMould(0);
+    return true;
+  }
+
+  // Slowly watch each layer; one that has coarsened to a piece or two for a while is broken back up.
+  function watchPieces() {
+    const list = activeSims();
+    if (state.letter) {
+      list.forEach((sim) => (sim.sparseSince = null)); // the wait starts over once the event is done
+      return;
+    }
+    const index = Math.floor(state.frames / 45) % list.length; // one layer per look
+    const sim = list[index];
+    const pieces = countPieces(readPhi(sim));
+    if (pieces > cfg.breakPieces) {
+      sim.sparseSince = null;
+      return;
+    }
+    if (sim.sparseSince == null) {
+      sim.sparseSince = state.time;
+      sim.breakWait = cfg.breakMin + Math.random() * (cfg.breakMax - cfg.breakMin);
+    } else if (state.time - sim.sparseSince >= sim.breakWait) {
+      sim.sparseSince = null;
+      startBreakUp(index);
+    }
+  }
+
   function updateLetter(dt) {
     const L = state.letter;
     if (!L) {
       state.env = 0;
       state.bump = 0;
+      return;
+    }
+    if (L.kind === "break") {
+      advanceBreak(L.clock, dt, cfg.breakWarp);
+      const b = breakView(L.clock, cfg.breakWarp);
+      if (b.done) {
+        state.letter = null;
+        state.env = 0;
+        state.bump = 0;
+        return;
+      }
+      if (b.s !== L.morph) updateMould(b.s);
+      state.env = b.env;
+      state.bump = b.bump;
       return;
     }
     advanceLetter(L.clock, dt, L.unified, cfg.warp);
@@ -775,10 +876,11 @@ export function startOilWheel(canvas, options = {}) {
     const mob = cfg.mob * cfg.flow * LAYER_MOBILITY[layerIndex] * state.rate;
     const a = -state.theta;
     const gdown = [Math.sin(a), -Math.cos(a)];
-    const env = layerIndex === LETTER_LAYER ? state.env : 0;
-    const iconTex = layerIndex === LETTER_LAYER && state.letter ? mouldTex : blankIcon;
+    const mine = layerIndex === mouldLayer(); // the mould is acting on this layer
+    const env = mine ? state.env : 0;
+    const iconTex = mine ? mouldTex : blankIcon;
     const pull = cfg.pull * Math.min(1, env * 3); // full strength until the release is well under way
-    const shake = layerIndex === LETTER_LAYER ? 1 + 4 * state.bump : 1; // stir harder as the letter lets go
+    const shake = mine ? 1 + 4 * state.bump : 1; // stir harder as the pull lets go
     const cur = () => sim.phi[sim.cur];
     const muPass = () =>
       pass(programs.mu, sim.mu, () => {
@@ -795,7 +897,8 @@ export function startOilWheel(canvas, options = {}) {
       gl.uniform2f(P.u("uGdown"), gdown[0], gdown[1]);
       gl.uniform1f(P.u("uBuoy"), cfg.buoy * sign * (1 - 0.85 * env));
       gl.uniform1f(P.u("uTheta"), state.theta);
-      const gathering = layerIndex === LETTER_LAYER && state.letter && state.letter.clock.phase === "gather";
+      // Moving oil a long way (gathering into a blob, or pulling a blob apart) gets the stronger push.
+      const gathering = mine && state.letter.clock.phase === (state.letter.kind === "letter" ? "gather" : "warp");
       gl.uniform1f(P.u("uMould"), cfg.mould * pull * state.rate * (gathering ? cfg.gatherBoost : 1));
       gl.uniform1f(P.u("uStir"), cfg.stir * cfg.flow * (1 - env) * shake);
       gl.uniform1f(P.u("uTime"), state.time);
@@ -808,7 +911,7 @@ export function startOilWheel(canvas, options = {}) {
       bind(programs.div, "uPD", 1, sim.pd[sim.pcur].tex);
     });
     sim.pcur = pdNext();
-    const hard = layerIndex === LETTER_LAYER && state.letter; // a letter is moving this layer's oil
+    const hard = mine; // the mould is moving this layer's oil across the wheel
     for (let i = 0; i < (hard ? cfg.jacobiLetter : cfg.jacobi); i += 1) {
       pass(programs.jacobi, sim.pd[pdNext()], () => {
         bind(programs.jacobi, "uPD", 0, sim.pd[sim.pcur].tex);
@@ -829,7 +932,7 @@ export function startOilWheel(canvas, options = {}) {
       gl.uniform1f(programs.advect.u("uBias"), sim.bias * state.rate);
       gl.uniform1f(programs.advect.u("uRestore"), sim.restore * state.rate);
       bind(programs.advect, "uFill", 3, fillRT.tex);
-      const filling = hard && ["gather", "warp", "hold"].includes(state.letter.clock.phase);
+      const filling = hard && state.letter.kind === "letter" && ["gather", "warp", "hold"].includes(state.letter.clock.phase);
       gl.uniform1f(programs.advect.u("uFillRate"), filling ? cfg.fill * state.rate : 0);
     });
     sim.cur = 1 - sim.cur;
@@ -943,7 +1046,7 @@ export function startOilWheel(canvas, options = {}) {
   function regulateVolume() {
     for (const sim of activeSims()) {
       const { oilFraction } = measure(sim);
-      const hard = sims.indexOf(sim) === LETTER_LAYER && state.letter;
+      const hard = sims.indexOf(sim) === mouldLayer();
       // While a letter is up the layer's target is the size of the letter's mould.
       const deficit = (hard ? state.letter.area / cells.length : sim.base) - oilFraction;
       // While a letter is up the regulator works harder: pushing the oil around the whole wheel leaves
@@ -976,7 +1079,8 @@ export function startOilWheel(canvas, options = {}) {
     stepLayer(sims[1], 1);
     if (state.third) stepLayer(sims[2], 2); // no GPU cost while the third layer is off
     if (state.frames % 20 === 0) regulateVolume();
-    if (state.letter && state.frames % cfg.analyseEvery === 0) analyseLetter();
+    if (state.letter && state.letter.kind === "letter" && state.frames % cfg.analyseEvery === 0) analyseLetter();
+    if (state.frames % 45 === 0) watchPieces();
     render();
     state.frames += 1;
     state.fpsFrames += 1;
@@ -1010,6 +1114,11 @@ export function startOilWheel(canvas, options = {}) {
       if (next && !state.third) pourLayer(2, randomSeed());
       state.third = next;
     },
+    // Break a layer's oil (0, 1 or 2) back up into fresh pieces now, instead of waiting for it to coarsen.
+    breakUp(layer = 1) {
+      state.letter = null; // like a new letter key, this takes over from whatever the mould was doing
+      return startBreakUp(layer);
+    },
     // Morph the second layer's oil into a letter, hold it, then let it spread back out.
     // Returns false for anything that is not A-Z.
     formLetter(ch) {
@@ -1025,6 +1134,8 @@ export function startOilWheel(canvas, options = {}) {
       const layer = sims[LETTER_LAYER];
       const area = layer.base * cells.length;
       const L = {
+        kind: "letter",
+        layer: LETTER_LAYER,
         ch: key,
         sdf: entry.sdf,
         dBlob: new Float32Array(N * N),
@@ -1054,9 +1165,10 @@ export function startOilWheel(canvas, options = {}) {
       return activeSims().map((sim, i) => {
         const buf = readPhi(sim);
         const out = { ...measure(sim, buf), target: sim.base };
+        out.pieces = countPieces(buf);
         if (i === LETTER_LAYER) {
-          out.letterOverlap = letterOverlap(buf);
-          out.letter = state.letter ? { phase: state.letter.clock.phase, pieces: state.letter.comps, unified: state.letter.unified, blobs: state.letter.blobs } : null;
+          out.letterOverlap = state.letter && state.letter.kind === "letter" ? letterOverlap(buf) : null;
+          out.letter = state.letter && state.letter.layer === i ? { kind: state.letter.kind, phase: state.letter.clock.phase, pieces: state.letter.comps, unified: state.letter.unified, blobs: state.letter.blobs } : null;
         }
         return out;
       });

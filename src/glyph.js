@@ -92,6 +92,34 @@ export function letterView(c, warp = WARP) {
   }
 }
 
+// ------------------------------------------------------------ break-up timeline
+
+// Left alone, a layer's oil slowly coarsens into one piece. A break-up event pushes it back
+// apart: the mould blends from the oil's current outline into a fresh random pattern (made the
+// same way as the opening pour), then the pull fades and the pieces carry on on their own.
+export const BREAK_WARP = 3.2; // seconds for the mass to flow into the new pieces
+export const BREAK_FADE = 2.2; // seconds for the pull to let go
+
+export function newBreakClock() {
+  return { phase: "warp", t: 0 };
+}
+
+export function advanceBreak(c, dt, warp = BREAK_WARP) {
+  c.t += dt;
+  if (c.phase === "warp" && c.t >= warp) (c.phase = "fade"), (c.t = 0);
+  else if (c.phase === "fade" && c.t >= BREAK_FADE) (c.phase = "idle"), (c.t = 0);
+  return c;
+}
+
+export function breakView(c, warp = BREAK_WARP) {
+  if (c.phase === "warp") return { phase: "warp", env: smooth(c.t / RAMP), s: smooth(c.t / warp), bump: 0, done: false };
+  if (c.phase === "fade") {
+    const u = c.t / BREAK_FADE;
+    return { phase: "fade", env: 1 - smooth((u - 0.4) / 0.6), s: 1, bump: Math.sin(Math.PI * Math.min(1, u)), done: false }; // holds on a moment while the necks pinch
+  }
+  return { phase: "idle", env: 0, s: 1, bump: 0, done: true };
+}
+
 export function isLetterKey(key) {
   return typeof key === "string" && /^[a-z]$/i.test(key);
 }
@@ -354,6 +382,87 @@ export function releaseField(rng, area, count = 1 + Math.floor(rng() * 4)) {
       }
     }
     discs.push(best);
+  }
+  const field = new Float32Array(N * N);
+  for (let y = 0; y < N; y += 1) {
+    for (let x = 0; x < N; x += 1) {
+      let d = 1e9;
+      for (const c of discs) d = Math.min(d, Math.hypot(x + 0.5 - c.x, y + 0.5 - c.y) - c.r);
+      field[y * N + x] = d;
+    }
+  }
+  return { field, count, discs };
+}
+
+// Where a mass of oil pinches off into lumps: 3-5 spread-out seeds are picked inside it, each lump
+// takes a share of the oil around its seed, and the discs are eased apart so they don't touch.
+// `mask` is 1 where there is oil. Returns a signed distance field like releaseField does.
+export function splitField(mask, rng, count = 3 + Math.floor(rng() * 3)) {
+  const cells = [];
+  for (let i = 0; i < mask.length; i += 1) if (mask[i] > 0.5) cells.push(i);
+  if (cells.length < count * 40) return releaseField(rng, Math.max(cells.length, 1), count);
+  const at = (i) => ({ x: (i % N) + 0.5, y: Math.floor(i / N) + 0.5 });
+  // Farthest-point seeds: well spread over the mass, but starting somewhere random.
+  const seeds = [at(cells[Math.floor(rng() * cells.length)])];
+  while (seeds.length < count) {
+    let best = null;
+    let bestD = -1;
+    for (let k = 0; k < cells.length; k += 7) {
+      const c = at(cells[k]);
+      const d = Math.min(...seeds.map((o) => Math.hypot(o.x - c.x, o.y - c.y)));
+      if (d > bestD) (bestD = d), (best = c);
+    }
+    seeds.push(best);
+  }
+  // Each cell of oil belongs to its nearest seed; the lump forms at the middle of its share.
+  const sums = seeds.map(() => ({ x: 0, y: 0, n: 0 }));
+  for (const i of cells) {
+    const c = at(i);
+    let who = 0;
+    let bestD = Infinity;
+    seeds.forEach((o, k) => {
+      const d = Math.hypot(o.x - c.x, o.y - c.y);
+      if (d < bestD) (bestD = d), (who = k);
+    });
+    sums[who].x += c.x;
+    sums[who].y += c.y;
+    sums[who].n += 1;
+  }
+  const shares = sums.map((q) => Math.max(q.n, 1) * (0.7 + rng() * 0.6));
+  const total = shares.reduce((a, b) => a + b, 0);
+  const area = cells.length;
+  const discs = sums.map((q, k) => ({
+    x: q.n ? q.x / q.n : seeds[k].x,
+    y: q.n ? q.y / q.n : seeds[k].y,
+    r: Math.sqrt((area * shares[k]) / total / Math.PI),
+  }));
+  // Ease overlapping lumps apart (and keep them in the glass).
+  const wheel = N / 2 - 2;
+  const gap = 18; // clear carrier between lumps, so the necks have room to pinch off
+  for (let pass = 0; pass < 60; pass += 1) {
+    for (let a = 0; a < discs.length; a += 1) {
+      for (let b = a + 1; b < discs.length; b += 1) {
+        const A = discs[a];
+        const B = discs[b];
+        const d = Math.hypot(B.x - A.x, B.y - A.y) || 1e-3;
+        const over = A.r + B.r + gap - d;
+        if (over > 0) {
+          const ux = (B.x - A.x) / d;
+          const uy = (B.y - A.y) / d;
+          A.x -= (ux * over) / 2;
+          A.y -= (uy * over) / 2;
+          B.x += (ux * over) / 2;
+          B.y += (uy * over) / 2;
+        }
+      }
+    }
+    for (const c of discs) {
+      const dx = c.x - N / 2;
+      const dy = c.y - N / 2;
+      const d = Math.hypot(dx, dy);
+      const limit = wheel - c.r - 4;
+      if (d > limit) (c.x = N / 2 + (dx / d) * limit), (c.y = N / 2 + (dy / d) * limit);
+    }
   }
   const field = new Float32Array(N * N);
   for (let y = 0; y < N; y += 1) {
