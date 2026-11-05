@@ -25,12 +25,13 @@ Needs a browser with WebGL2 and float render targets (`EXT_color_buffer_float`):
 |---|---|
 | Palette presets | Classic, Ember, Aurora, Lagoon, Violet, plus Mickey, Donald and Pluto character palettes. |
 | Swatches | Oil A, Oil B, Oil C, carrier (the base colour of the field), lamp and wall. Saved in `localStorage`. |
-| Third oil layer (`T`) | Optional third layer using the Oil C colour. Off by default and costs nothing while off. |
+| Third oil layer (`3`) | Optional third layer using the Oil C colour. Off by default and costs nothing while off. |
 | Flow & rotation | Speed of the wheel and the oil. |
-| New pour (`N`) | Fresh random blobs in every layer. |
-| Fullscreen (`F`), Hide controls (`H`) | For using it as a display. |
+| New pour (`Space`) | Fresh random blobs in every layer. |
+| Fullscreen (`Enter`), Hide controls (`Esc`) | For using it as a display. |
+| Letters (`A` to `Z`) | The second oil gathers into that letter over about 6 seconds, holds it for 3, then lets go and spreads back into a random pattern. Pressing another letter mid-way redirects the oil. Keys with Ctrl, Cmd or Alt are ignored. |
 
-From the console, `oilWheel.cfg` holds the simulation constants and `oilWheel.stats()` reports each active layer's oil fraction.
+From the console, `oilWheel.cfg` holds the simulation constants, `oilWheel.formLetter("R")` triggers a letter, and `oilWheel.stats()` reports each active layer's oil fraction (and, while a letter is up, how much of the letter the oil covers).
 
 ## How it works
 
@@ -41,6 +42,7 @@ Everything is in `src/oilwheel.js`, on the GPU, one simulation per layer at 256Ã
 - **Rotation.** The wheel turns, so gravity rotates in the wheel frame. That is what keeps the oil moving. Each layer's oil has slightly different buoyancy and mobility, so the layers drift apart.
 - **Optics.** Each layer is a translucent dye filter, so the layers multiply. Meniscus lensing darkens and brightens blob edges, and a lamp hotspot, glass rim, bloom, slight chromatic fringe and grain finish it.
 - **Volume regulator.** Every 20 frames the oil fraction of each layer is measured. A small interface bias nudges it back toward its starting share. If a layer ever runs very low there may be no interface left to grow, so fresh oil condenses from a new noise pour.
+- **Letters.** A key renders a bold glyph to a canvas and turns it into three fields (sharp mask, soft mask, distance). The glyph is fixed in the viewer's frame, so it stays upright while the wheel turns. The second oil is pulled toward it by a gradient force, its edges creep toward the letter outline, oil condenses inside the strokes and oil far from the letter slowly dissolves. The last two do not conserve volume, so each place is given its own random onset time: oil condenses in patches at different moments and swells together, rather than the whole letter appearing at once. On release the stirring is boosted so the oil breaks up and spreads back out, and the volume regulator hands over to a fresh random pattern.
 - **Frame-rate independence.** Per-step strengths are tuned at about 43 fps and scaled by frame time, so a slow GPU moves the same oil per second.
 
 ## Layout
@@ -48,6 +50,8 @@ Everything is in `src/oilwheel.js`, on the GPU, one simulation per layer at 256Ã
 ```
 index.html        page and controls
 src/oilwheel.js   the simulation and renderer (startOilWheel)
+src/glyph.js      letter timeline and glyph-to-field conversion
+src/grid.js       simulation grid size shared by the two
 src/presets.js    palette presets
 src/app.js        palette, presets, keys, persistence
 src/style.css

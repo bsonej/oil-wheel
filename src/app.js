@@ -1,4 +1,5 @@
 import { DEFAULT_PALETTE, startOilWheel } from "./oilwheel.js";
+import { isLetterKey } from "./glyph.js";
 import { PRESETS } from "./presets.js";
 
 const STORE_KEY = "oilwheel.v1";
@@ -101,13 +102,22 @@ if (!wheel.ok) {
   $("fullscreen").addEventListener("click", toggleFullscreen);
   $("hide-panel").addEventListener("click", () => setPanel(false));
   reveal.addEventListener("click", () => setPanel(true));
+  // Letters belong to the oil: A-Z forms that letter in the second layer.
+  // Everything else lives on non-letter keys so the two never collide.
   window.addEventListener("keydown", (event) => {
-    if (event.metaKey || event.ctrlKey || event.altKey) return;
-    const key = event.key.toLowerCase();
-    if (key === "h") setPanel(panel.hidden);
-    else if (key === "f") toggleFullscreen();
-    else if (key === "n") wheel.reseed();
-    else if (key === "t") {
+    if (event.metaKey || event.ctrlKey || event.altKey || event.repeat) return;
+    const target = event.target;
+    if (target instanceof HTMLElement && target.matches("input[type='text'], textarea, select")) return;
+    if (isLetterKey(event.key)) {
+      wheel.formLetter(event.key);
+      return;
+    }
+    if (event.key === "Escape") setPanel(panel.hidden);
+    else if (event.key === "Enter" && !(target instanceof HTMLButtonElement)) toggleFullscreen();
+    else if (event.key === " " && !(target instanceof HTMLButtonElement || target instanceof HTMLInputElement)) {
+      event.preventDefault();
+      wheel.reseed();
+    } else if (event.key === "3") {
       third = !third;
       apply();
     }

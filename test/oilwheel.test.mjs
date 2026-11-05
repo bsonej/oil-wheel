@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_PALETTE, N, hexToVec, makeInitialPhase } from "../src/oilwheel.js";
+import { DEFAULT_PALETTE, N, hexToVec, makeInitialPhase, makeStagger } from "../src/oilwheel.js";
 
 test("hexToVec parses long and short hex, tolerating junk", () => {
   assert.deepEqual(hexToVec("#ff0000"), [1, 0, 0]);
@@ -45,4 +45,28 @@ test("phase values are bounded and the corners (outside the glass) are carrier",
   const phi = makeInitialPhase(99, 0.3);
   assert.equal(phi[0], -1);
   assert.ok(phi.every((v) => v >= -1 && v <= 1));
+});
+
+test("makeStagger gives smooth, evenly spread onset times in [0, 1]", () => {
+  const st = makeStagger(5);
+  assert.equal(st.length, N * N);
+  let min = 1;
+  let max = 0;
+  let sum = 0;
+  let stepSum = 0;
+  let steps = 0;
+  for (let i = 0; i < st.length; i += 1) {
+    min = Math.min(min, st[i]);
+    max = Math.max(max, st[i]);
+    sum += st[i];
+    if (i % N) {
+      stepSum += Math.abs(st[i] - st[i - 1]);
+      steps += 1;
+    }
+  }
+  assert.equal(min, 0);
+  assert.equal(max, 1);
+  assert.ok(Math.abs(sum / st.length - 0.5) < 0.01, "rank-normalised, so the mean is one half");
+  assert.ok(stepSum / steps < 0.03, `neighbouring onsets should be close (mean step ${stepSum / steps}; white noise is ~0.33)`);
+  assert.notDeepEqual(Array.from(makeStagger(6).slice(0, 50)), Array.from(st.slice(0, 50)));
 });
