@@ -12,7 +12,22 @@
 //     blob edges. A lamp hotspot, glass rim, halo bloom and grain finish it.
 
 import { N } from "./grid.js";
-import { FORM, buildGlyphData, invSmooth, isLetterKey, letterEnvelope } from "./glyph.js";
+import {
+  WARP,
+  advanceLetter,
+  blendMould,
+  blobDistance,
+  blobRadius,
+  buildGlyphData,
+  dilate,
+  findHoles,
+  isLetterKey,
+  labelOil,
+  letterView,
+  newLetterClock,
+  releaseField,
+  wheelCells,
+} from "./glyph.js";
 
 export { N };
 export const DEFAULT_PALETTE = {
@@ -108,18 +123,6 @@ export function makeInitialPhase(seed, fraction, cell = 34) {
   return phi;
 }
 
-// Smooth random onset times in [0, 1], evenly spread (rank-normalised), so staggered effects
-// start across the whole duration instead of bunching up.
-export function makeStagger(seed, cell = 26) {
-  const noise = valueNoise(mulberry32(seed), cell, 2);
-  const order = Array.from(noise.keys()).sort((a, b) => noise[a] - noise[b]);
-  const out = new Float32Array(N * N);
-  order.forEach((idx, rank) => {
-    out[idx] = rank / (order.length - 1);
-  });
-  return out;
-}
-
 // ------------------------------------------------------------------- shaders
 
 const VERT = `#version 300 es
@@ -191,9 +194,7 @@ uniform sampler2D uIcon;
 uniform vec2 uGdown;
 uniform float uBuoy;
 uniform float uTheta;
-uniform float uKN;
-uniform float uKM;
-uniform float uKF;
+uniform float uMould;
 uniform float uStir;
 uniform float uTime;
 uniform float uSeed;
@@ -210,7 +211,8 @@ vec2 stir(vec2 x, float t){
   }
   return v;
 }
-vec3 iconAt(vec2 viewCells){ return texture(uIcon, (viewCells + 0.5 * FN) / FN).rgb; }
+// The mould: signed distance (cells, negative inside) in the view frame.
+float mouldAt(vec2 viewCells){ return texture(uIcon, (viewCells + 0.5 * FN) / FN).r; }
 void main(){
   ivec2 c = ivec2(gl_FragCoord.xy);
   if (!fluid(c)) { o = vec4(0.0); return; }
@@ -221,10 +223,13 @@ void main(){
   float oil = clamp(0.5 * (p + 1.0), 0.0, 1.0);
   f -= uBuoy * oil * uGdown;                        // buoyancy of the oil phase
   vec2 v = rot(vec2(c) + 0.5 - 0.5 * FN, uTheta);   // wheel frame -> view frame
-  vec3 gx = iconAt(v + vec2(1.0, 0.0)) - iconAt(v - vec2(1.0, 0.0));
-  vec3 gy = iconAt(v + vec2(0.0, 1.0)) - iconAt(v - vec2(0.0, 1.0));
-  vec2 gv = 0.5 * (uKN * vec2(gx.x, gy.x) + uKM * vec2(gx.y, gy.y) + uKF * vec2(gx.z, gy.z));
-  f += oil * rot(gv, -uTheta);                      // pull oil toward the letter
+  // Oil outside the mould is pushed toward it (a steady push, easing in over a few cells);
+  // oil inside feels nothing, so the incompressible flow spreads it to fill the mould.
+  float e = mouldAt(v);
+  vec2 ge = 0.5 * vec2(mouldAt(v + vec2(1.0, 0.0)) - mouldAt(v - vec2(1.0, 0.0)),
+                       mouldAt(v + vec2(0.0, 1.0)) - mouldAt(v - vec2(0.0, 1.0)));
+  vec2 inward = -ge / max(length(ge), 0.4);
+  f += oil * uMould * smoothstep(0.0, 5.0, e) * rot(inward, -uTheta);
   f += uStir * stir((vec2(c) + 0.5) / FN * 6.2831853, uTime);
   o = vec4(f, 0.0, 1.0);
 }`;
@@ -247,6 +252,7 @@ void main(){
 
 const FS_JACOBI = `${HEAD}
 uniform sampler2D uPD;
+uniform float uDamp;
 void main(){
   ivec2 c = ivec2(gl_FragCoord.xy);
   if (!fluid(c)) { o = vec4(0.0); return; }
@@ -257,7 +263,7 @@ void main(){
   if (fluid(c - EX)) { s += texelFetch(uPD, c - EX, 0).r; n += 1.0; }
   if (fluid(c + EY)) { s += texelFetch(uPD, c + EY, 0).r; n += 1.0; }
   if (fluid(c - EY)) { s += texelFetch(uPD, c - EY, 0).r; n += 1.0; }
-  o = vec4(n > 0.0 ? 0.9995 * (s - d) / n : 0.0, d, 0.0, 1.0);
+  o = vec4(n > 0.0 ? uDamp * (s - d) / n : 0.0, d, 0.0, 1.0);
 }`;
 
 const FS_VEL = `${HEAD}
@@ -289,13 +295,8 @@ uniform sampler2D uVel;
 uniform float uBias;
 uniform sampler2D uHome;
 uniform float uRestore;
-uniform sampler2D uIcon;
-uniform float uPaint;
-uniform float uErode;
-uniform float uSeedK;
-uniform float uEnv;
-uniform sampler2D uStagger;
-uniform float uTheta;
+uniform sampler2D uFill;
+uniform float uFillRate;
 float T(ivec2 i){ return texelFetch(uPhi, clamp(i, ivec2(0), ivec2(N - 1)), 0).r; }
 float samp(vec2 x){
   vec2 g = x - 0.5;
@@ -309,20 +310,7 @@ void main(){
   vec2 u = texelFetch(uVel, c, 0).xy;
   float p = samp(vec2(c) + 0.5 - u);
   p += uBias * (1.0 - p * p);                 // volume regulator (acts at interfaces)
-  // A letter: interfaces inside it creep outward to fill it, those outside creep inward,
-  // its core condenses oil where there is none, and oil far from it dissolves.
-  vec2 v = rot(vec2(c) + 0.5 - 0.5 * FN, uTheta);
-  vec3 ic = texture(uIcon, (v + 0.5 * FN) / FN).rgb;
-  float dir = clamp((ic.r - 0.42) * 4.0, -0.7, 1.0);
-  float core = clamp((ic.r - 0.6) * 3.0, 0.0, 1.0);
-  p += uPaint * dir * (1.0 - p * p);
-  // Each place gets its own onset time from a smooth random field, so oil condenses in patches
-  // at different moments (and far oil dissolves in the opposite order) instead of all at once.
-  float st = texelFetch(uStagger, c, 0).r;
-  float seedGate = smoothstep(0.0, 0.2, uEnv - 0.1 - 0.75 * st);
-  float erodeGate = smoothstep(0.0, 0.2, uEnv - 0.1 - 0.75 * (1.0 - st));
-  p += uSeedK * uPaint * core * seedGate * (1.0 - p);
-  p += uErode * erodeGate * (1.0 - smoothstep(0.03, 0.3, ic.g)) * (-1.0 - p);
+  p += uFillRate * texelFetch(uFill, c, 0).r * (1.0 - p);   // close gaps enclosed inside the oil
   // If a layer ever runs low, condense fresh oil where a noise pattern says so.
   float home = texelFetch(uHome, c, 0).r;
   p += uRestore * clamp(home, 0.0, 1.0) * (1.0 - p);
@@ -450,6 +438,15 @@ export function startOilWheel(canvas, options = {}) {
 
   const cfg = {
     jacobi: 64,
+    damp: 0.9995, // pressure damping per Jacobi iteration (stops the solve drifting)
+    // While a letter is up, the second layer moves its oil across the whole wheel. That is a very large-scale
+    // flow, so it needs a much stiffer pressure solve (more iterations, almost no damping) to stay
+    // incompressible; otherwise the oil is squashed and its volume drains away.
+    jacobiLetter: 160,
+    dampLetter: 0.99999,
+    maxVLetter: 1.4,
+    letterVolumeGain: 0.4, // regulator gain and limit while a letter is up
+    letterBiasCap: 0.025,
     chSteps: 6,
     eps2: 1.5,
     mobilityCH: 2.0,
@@ -459,15 +456,12 @@ export function startOilWheel(canvas, options = {}) {
     buoy: 0.012,
     stir: 0.006,
     volumeGain: 0.03,
-    kN: 0.8, // letter pull: sharp edge, mid-range, and far-field strengths
-    kM: 2.5,
-    kF: 0.07,
-    paint: 0.04, // how fast interfaces creep to the letter edge, per frame at full strength
-    erode: 0.01, // how fast oil far from the letter dissolves, per frame at full strength
+    mould: 0.45, // push on oil that is outside the letter mould, per frame at full strength
+    gatherBoost: 2.0, // the push is this much stronger while the oil is still gathering into one blob
     pull: 1,
-    seed: 0.3, // how strongly the letter's core condenses oil where there is none (x paint)
-    ramp: 0.7, // the non-conservative terms follow env^ramp; lower = they start earlier and gentler
-    form: FORM, // seconds for the oil to gather into the letter
+    warp: WARP, // seconds for the single blob to flow into the letter
+    fill: 0.12, // how fast gaps inside the unified mass close, per frame
+    analyseEvery: 8, // frames between looks at the oil (one mass? any gaps?)
     rot: 0.1,
     exposure: 1.0,
     flow: 1,
@@ -636,26 +630,144 @@ export function startOilWheel(canvas, options = {}) {
   // Letters only act on the second layer; the other layers keep drifting untouched.
   const LETTER_LAYER = 1;
   const blankIcon = iconTexture(new Float32Array(4), 1);
-  const staggerRT = makeRT(N, N, gl.R32F);
-  upload(staggerRT, new Float32Array(N * N).fill(0.5), gl.RED);
   const glyphCache = new Map();
+  const cells = wheelCells();
+  const mouldData = new Float32Array(N * N * 4); // the current mould, signed distance in .r
+  const mouldTex = iconTexture(mouldData);
+
+  const radial = blobDistance(0); // distance of every cell from the centre
+  const insideMask = new Uint8Array(N * N);
+  for (const i of cells) insideMask[i] = 1;
+  const fillRT = makeRT(N, N, gl.R32F); // gaps to close, in the wheel frame
+  const fillData = new Float32Array(N * N);
+  upload(fillRT, fillData, gl.RED);
+  let fillDirty = false;
+  const phiScratch = new Float32Array(N * N);
+
+  function setBlobArea(L, area) {
+    L.area = area;
+    const r = blobRadius(area);
+    for (let i = 0; i < radial.length; i += 1) L.dBlob[i] = radial[i] - r;
+  }
+
+  function updateMould(morph) {
+    const L = state.letter;
+    blendMould(L.from, L.to, morph, cells, L.area, mouldData);
+    gl.bindTexture(gl.TEXTURE_2D, mouldTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, N, N, gl.RGBA, gl.FLOAT, mouldData);
+    L.morph = morph;
+  }
+
+  function clearFill() {
+    if (!fillDirty) return;
+    fillData.fill(0);
+    upload(fillRT, fillData, gl.RED);
+    fillDirty = false;
+  }
+
+  // Index into the view-frame mould of the cell at wheel-frame (x, y), as the shaders do.
+  function viewIndex(x, y, c, sn) {
+    const dx = x + 0.5 - N / 2;
+    const dy = y + 0.5 - N / 2;
+    const vx = Math.floor(c * dx - sn * dy + N / 2);
+    const vy = Math.floor(sn * dx + c * dy + N / 2);
+    return vx >= 0 && vy >= 0 && vx < N && vy < N ? vy * N + vx : -1;
+  }
+
+  // Look at the second layer's oil: is it one compact mass, and are there gaps enclosed inside it?
+  // This reads the field back, so it only runs every few frames and only while a letter is up.
+  function analyseLetter() {
+    const L = state.letter;
+    const buf = readPhi(sims[LETTER_LAYER]);
+    for (let i = 0; i < N * N; i += 1) phiScratch[i] = buf[i * 4];
+    const lab = labelOil(phiScratch, insideMask);
+    const c = Math.cos(state.theta);
+    const sn = Math.sin(state.theta);
+    let near = 0;
+    for (let y = 0; y < N; y += 1) {
+      for (let x = 0; x < N; x += 1) {
+        const i = y * N + x;
+        if (!insideMask[i] || !(phiScratch[i] > 0)) continue;
+        const v = viewIndex(x, y, c, sn);
+        if (v >= 0 && mouldData[v * 4] < 2) near += 1;
+      }
+    }
+    L.comps = lab.big;
+    L.oilCells = lab.total;
+    // One mass, sitting in the mould (so it is the round blob, not a stray piece far away).
+    L.unified = lab.big === 1 && lab.total > 0 && near / lab.total > 0.9;
+
+    const filling = L.clock.phase === "gather" || L.clock.phase === "warp" || L.clock.phase === "hold";
+    if (!filling) return clearFill();
+    // Gaps are closed by the main mass growing into them: pockets enclosed by oil, and carrier lying
+    // right next to the mass. Only inside the mould, so a letter's real holes (the counter of an R,
+    // say) stay open, and only next to the main mass, so no new patch can appear anywhere.
+    const holes = findHoles(phiScratch, insideMask);
+    const mass = new Uint8Array(N * N);
+    for (let i = 0; i < N * N; i += 1) mass[i] = lab.label[i] === lab.largestId && lab.largestId ? 1 : 0;
+    const reach = dilate(mass, 3);
+    let any = false;
+    for (let y = 0; y < N; y += 1) {
+      for (let x = 0; x < N; x += 1) {
+        const i = y * N + x;
+        let v = 0;
+        if (holes[i] || (reach[i] && insideMask[i])) {
+          const m = viewIndex(x, y, c, sn);
+          if (m >= 0 && mouldData[m * 4] < -1.5) v = 1;
+        }
+        fillData[i] = v;
+        if (v) any = true;
+      }
+    }
+    if (any || fillDirty) {
+      upload(fillRT, fillData, gl.RED);
+      fillDirty = any;
+    }
+  }
+
+  // Each stage hands the mould a new pair of outlines to blend between.
+  function enterPhase(L, phase) {
+    if (phase === "warp") {
+      // The unified mass sets the letter's size, within reason: it may grow or shrink a little to fit.
+      const base = sims[LETTER_LAYER].base * cells.length;
+      const area = L.oilCells ? Math.max(0.85 * base, Math.min(1.15 * base, L.oilCells)) : base;
+      setBlobArea(L, area);
+      L.from = L.dBlob;
+      L.to = L.sdf;
+    } else if (phase === "hold") {
+      L.from = L.sdf;
+      L.to = L.sdf;
+    } else if (phase === "release") {
+      const out = releaseField(L.rng, L.area);
+      L.blobs = out.count;
+      L.from = L.sdf;
+      L.to = out.field;
+    }
+    L.phase = phase;
+    L.morph = -1;
+  }
 
   function updateLetter(dt) {
-    if (!state.letter) {
+    const L = state.letter;
+    if (!L) {
       state.env = 0;
       state.bump = 0;
       return;
     }
-    state.letter.t += dt;
-    const e = letterEnvelope(state.letter.t, cfg.form);
-    if (e.done) {
+    advanceLetter(L.clock, dt, L.unified, cfg.warp);
+    const v = letterView(L.clock, cfg.warp);
+    if (v.done) {
       state.letter = null;
       state.env = 0;
       state.bump = 0;
+      clearFill();
       return;
     }
-    state.env = e.env;
-    state.bump = e.phase === "release" ? Math.sin(Math.PI * e.release) : 0;
+    if (L.clock.phase !== L.phase) enterPhase(L, L.clock.phase);
+    const s = v.phase === "gather" ? 0 : v.phase === "hold" ? 1 : v.s;
+    if (s !== L.morph) updateMould(s);
+    state.env = v.env;
+    state.bump = v.bump;
   }
 
   function stepLayer(sim, layerIndex) {
@@ -664,8 +776,8 @@ export function startOilWheel(canvas, options = {}) {
     const a = -state.theta;
     const gdown = [Math.sin(a), -Math.cos(a)];
     const env = layerIndex === LETTER_LAYER ? state.env : 0;
-    const iconTex = layerIndex === LETTER_LAYER && state.letter ? state.letter.tex : blankIcon;
-    const pull = cfg.pull * Math.min(1, env * 3); // the pull engages early; the volume change ramps in more slowly
+    const iconTex = layerIndex === LETTER_LAYER && state.letter ? mouldTex : blankIcon;
+    const pull = cfg.pull * Math.min(1, env * 3); // full strength until the release is well under way
     const shake = layerIndex === LETTER_LAYER ? 1 + 4 * state.bump : 1; // stir harder as the letter lets go
     const cur = () => sim.phi[sim.cur];
     const muPass = () =>
@@ -683,9 +795,8 @@ export function startOilWheel(canvas, options = {}) {
       gl.uniform2f(P.u("uGdown"), gdown[0], gdown[1]);
       gl.uniform1f(P.u("uBuoy"), cfg.buoy * sign * (1 - 0.85 * env));
       gl.uniform1f(P.u("uTheta"), state.theta);
-      gl.uniform1f(P.u("uKN"), cfg.kN * pull);
-      gl.uniform1f(P.u("uKM"), cfg.kM * pull);
-      gl.uniform1f(P.u("uKF"), cfg.kF * pull);
+      const gathering = layerIndex === LETTER_LAYER && state.letter && state.letter.clock.phase === "gather";
+      gl.uniform1f(P.u("uMould"), cfg.mould * pull * state.rate * (gathering ? cfg.gatherBoost : 1));
       gl.uniform1f(P.u("uStir"), cfg.stir * cfg.flow * (1 - env) * shake);
       gl.uniform1f(P.u("uTime"), state.time);
       gl.uniform1f(P.u("uSeed"), layerIndex * 5.3);
@@ -697,9 +808,11 @@ export function startOilWheel(canvas, options = {}) {
       bind(programs.div, "uPD", 1, sim.pd[sim.pcur].tex);
     });
     sim.pcur = pdNext();
-    for (let i = 0; i < cfg.jacobi; i += 1) {
+    const hard = layerIndex === LETTER_LAYER && state.letter; // a letter is moving this layer's oil
+    for (let i = 0; i < (hard ? cfg.jacobiLetter : cfg.jacobi); i += 1) {
       pass(programs.jacobi, sim.pd[pdNext()], () => {
         bind(programs.jacobi, "uPD", 0, sim.pd[sim.pcur].tex);
+        gl.uniform1f(programs.jacobi.u("uDamp"), hard ? cfg.dampLetter : cfg.damp);
       });
       sim.pcur = pdNext();
     }
@@ -707,22 +820,17 @@ export function startOilWheel(canvas, options = {}) {
       bind(programs.vel, "uF", 0, sim.f.tex);
       bind(programs.vel, "uPD", 1, sim.pd[sim.pcur].tex);
       gl.uniform1f(programs.vel.u("uMob"), mob);
-      gl.uniform1f(programs.vel.u("uMax"), cfg.maxV * state.rate);
+      gl.uniform1f(programs.vel.u("uMax"), (hard ? cfg.maxVLetter : cfg.maxV) * state.rate);
     });
     pass(programs.advect, sim.phi[1 - sim.cur], () => {
       bind(programs.advect, "uPhi", 0, cur().tex);
       bind(programs.advect, "uVel", 1, sim.vel.tex);
       bind(programs.advect, "uHome", 2, sim.home.tex);
-      bind(programs.advect, "uIcon", 3, iconTex);
-      bind(programs.advect, "uStagger", 4, staggerRT.tex);
-      gl.uniform1f(programs.advect.u("uEnv"), env);
       gl.uniform1f(programs.advect.u("uBias"), sim.bias * state.rate);
       gl.uniform1f(programs.advect.u("uRestore"), sim.restore * state.rate);
-      const ramp = env ** cfg.ramp;
-      gl.uniform1f(programs.advect.u("uPaint"), cfg.paint * ramp * state.rate);
-      gl.uniform1f(programs.advect.u("uErode"), cfg.erode * ramp * state.rate);
-      gl.uniform1f(programs.advect.u("uSeedK"), cfg.seed);
-      gl.uniform1f(programs.advect.u("uTheta"), state.theta);
+      bind(programs.advect, "uFill", 3, fillRT.tex);
+      const filling = hard && ["gather", "warp", "hold"].includes(state.letter.clock.phase);
+      gl.uniform1f(programs.advect.u("uFillRate"), filling ? cfg.fill * state.rate : 0);
     });
     sim.cur = 1 - sim.cur;
 
@@ -790,7 +898,6 @@ export function startOilWheel(canvas, options = {}) {
   // Diagnostic only: it reads the field back, so it is not part of the frame loop.
   function letterOverlap(buf) {
     if (!state.letter) return null;
-    const { data } = state.letter;
     const c = Math.cos(state.theta);
     const s = Math.sin(state.theta);
     let both = 0;
@@ -803,7 +910,7 @@ export function startOilWheel(canvas, options = {}) {
         const dy = y + 0.5 - N / 2;
         const vx = Math.floor(c * dx - s * dy + N / 2); // wheel frame -> view frame, as in the shaders
         const vy = Math.floor(s * dx + c * dy + N / 2);
-        const inLetter = vx >= 0 && vy >= 0 && vx < N && vy < N && data[(vy * N + vx) * 4] > 0.5;
+        const inLetter = vx >= 0 && vy >= 0 && vx < N && vy < N && mouldData[(vy * N + vx) * 4] < 0; // inside the current mould
         const inOil = buf[i * 4] > 0;
         if (inLetter && inOil) both += 1;
         if (inLetter || inOil) either += 1;
@@ -814,16 +921,20 @@ export function startOilWheel(canvas, options = {}) {
 
   function measure(sim, buf = readPhi(sim)) {
     let oil = 0;
+    let mass = 0;
     let cells = 0;
     let nan = 0;
     for (let i = 0; i < N * N; i += 1) {
       if (buf[i * 4 + 2] > 0.5) {
         cells += 1;
         if (!Number.isFinite(buf[i * 4])) nan += 1;
-        else if (buf[i * 4] > 0) oil += 1;
+        else {
+          if (buf[i * 4] > 0) oil += 1;
+          mass += Math.max(0, Math.min(1, 0.5 * (buf[i * 4] + 1)));
+        }
       }
     }
-    return { oilFraction: oil / cells, nan };
+    return { oilFraction: oil / cells, oilMass: mass / cells, nan };
   }
 
   // Keep each layer's oil volume near its starting share so the wheel never drains.
@@ -832,17 +943,19 @@ export function startOilWheel(canvas, options = {}) {
   function regulateVolume() {
     for (const sim of activeSims()) {
       const { oilFraction } = measure(sim);
-      const deficit = sim.base - oilFraction;
-      // While a letter holds the second layer it owns that layer's volume; the regulator
-      // only comes back as the pull fades, so the letter can spread into a fresh pour.
-      const calm = sims.indexOf(sim) === LETTER_LAYER ? 1 - Math.min(1, state.env * 2) : 1;
-      sim.bias = Math.max(-0.006, Math.min(0.006, deficit * cfg.volumeGain)) * calm;
-      if (deficit > 0.04 && !sim.restoring) {
+      const hard = sims.indexOf(sim) === LETTER_LAYER && state.letter;
+      // While a letter is up the layer's target is the size of the letter's mould.
+      const deficit = (hard ? state.letter.area / cells.length : sim.base) - oilFraction;
+      // While a letter is up the regulator works harder: pushing the oil around the whole wheel leaves
+      // small incompressibility errors, and this gently inflates or deflates the oil to cancel them.
+      const cap = hard ? cfg.letterBiasCap : 0.006;
+      sim.bias = Math.max(-cap, Math.min(cap, deficit * (hard ? cfg.letterVolumeGain : cfg.volumeGain)));
+      if (deficit > 0.04 && !sim.restoring && !hard) {
         upload(sim.home, makeInitialPhase(randomSeed(), sim.base), gl.RED);
         sim.restoring = true;
       }
       if (deficit < 0.01) sim.restoring = false;
-      sim.restore = sim.restoring ? Math.min(0.006, Math.max(deficit, 0) * 0.08) * calm : 0;
+      sim.restore = sim.restoring ? Math.min(0.006, Math.max(deficit, 0) * 0.08) : 0;
     }
   }
 
@@ -863,6 +976,7 @@ export function startOilWheel(canvas, options = {}) {
     stepLayer(sims[1], 1);
     if (state.third) stepLayer(sims[2], 2); // no GPU cost while the third layer is off
     if (state.frames % 20 === 0) regulateVolume();
+    if (state.letter && state.frames % cfg.analyseEvery === 0) analyseLetter();
     render();
     state.frames += 1;
     state.fpsFrames += 1;
@@ -903,23 +1017,47 @@ export function startOilWheel(canvas, options = {}) {
       const key = ch.toUpperCase();
       let entry = glyphCache.get(key);
       if (!entry) {
-        const built = buildGlyphData(key);
-        entry = { tex: iconTexture(built.data), data: built.data };
+        entry = buildGlyphData(key);
         glyphCache.set(key, entry);
       }
-      // A new key mid-sequence re-forms from where the pull is now, but never from fully formed,
-      // so the oil has to travel to the new shape instead of snapping to it.
-      const startEnv = Math.min(state.env, 0.5);
-      state.letter = { ch: key, tex: entry.tex, data: entry.data, t: cfg.form * invSmooth(startEnv) };
-      upload(sims[LETTER_LAYER].home, makeInitialPhase(randomSeed(), sims[LETTER_LAYER].base), gl.RED);
-      upload(staggerRT, makeStagger(randomSeed()), gl.RED);
+      // A new key mid-sequence keeps the pull where it is and re-gathers: the old letter melts back
+      // into a blob and flows into the new one.
+      const layer = sims[LETTER_LAYER];
+      const area = layer.base * cells.length;
+      const L = {
+        ch: key,
+        sdf: entry.sdf,
+        dBlob: new Float32Array(N * N),
+        from: null,
+        to: null,
+        area,
+        clock: newLetterClock(Math.min(1, state.env)),
+        phase: "gather",
+        morph: -1,
+        unified: false,
+        comps: null,
+        oilCells: 0,
+        blobs: 0,
+        rng: mulberry32(randomSeed()),
+      };
+      setBlobArea(L, area);
+      L.from = L.dBlob;
+      L.to = L.dBlob;
+      state.letter = L;
+      updateMould(0);
+      // No fresh patches may be spawned while the letter is up: only the one mass may grow or shrink.
+      layer.restoring = false;
+      layer.restore = 0;
       return true;
     },
     stats() {
       return activeSims().map((sim, i) => {
         const buf = readPhi(sim);
         const out = { ...measure(sim, buf), target: sim.base };
-        if (i === LETTER_LAYER) out.letterOverlap = letterOverlap(buf);
+        if (i === LETTER_LAYER) {
+          out.letterOverlap = letterOverlap(buf);
+          out.letter = state.letter ? { phase: state.letter.clock.phase, pieces: state.letter.comps, unified: state.letter.unified, blobs: state.letter.blobs } : null;
+        }
         return out;
       });
     },

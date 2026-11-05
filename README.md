@@ -29,7 +29,7 @@ Needs a browser with WebGL2 and float render targets (`EXT_color_buffer_float`):
 | Flow & rotation | Speed of the wheel and the oil. |
 | New pour (`Space`) | Fresh random blobs in every layer. |
 | Fullscreen (`Enter`), Hide controls (`Esc`) | For using it as a display. |
-| Letters (`A` to `Z`) | The second oil gathers into that letter over about 6 seconds, holds it for 3, then lets go and spreads back into a random pattern. Pressing another letter mid-way redirects the oil. Keys with Ctrl, Cmd or Alt are ignored. |
+| Letters (`A` to `Z`) | The second oil flows together into one blob, the blob flows into that letter, it is held for 3 seconds, then the letter flows apart into a random 1 to 4 blobs that drift off. Pressing another letter mid-way melts the current one back into a blob and flows into the new letter. Keys with Ctrl, Cmd or Alt are ignored. |
 
 From the console, `oilWheel.cfg` holds the simulation constants, `oilWheel.formLetter("R")` triggers a letter, and `oilWheel.stats()` reports each active layer's oil fraction (and, while a letter is up, how much of the letter the oil covers).
 
@@ -42,7 +42,13 @@ Everything is in `src/oilwheel.js`, on the GPU, one simulation per layer at 256Ã
 - **Rotation.** The wheel turns, so gravity rotates in the wheel frame. That is what keeps the oil moving. Each layer's oil has slightly different buoyancy and mobility, so the layers drift apart.
 - **Optics.** Each layer is a translucent dye filter, so the layers multiply. Meniscus lensing darkens and brightens blob edges, and a lamp hotspot, glass rim, bloom, slight chromatic fringe and grain finish it.
 - **Volume regulator.** Every 20 frames the oil fraction of each layer is measured. A small interface bias nudges it back toward its starting share. If a layer ever runs very low there may be no interface left to grow, so fresh oil condenses from a new noise pour.
-- **Letters.** A key renders a bold glyph to a canvas and turns it into three fields (sharp mask, soft mask, distance). The glyph is fixed in the viewer's frame, so it stays upright while the wheel turns. The second oil is pulled toward it by a gradient force, its edges creep toward the letter outline, oil condenses inside the strokes and oil far from the letter slowly dissolves. The last two do not conserve volume, so each place is given its own random onset time: oil condenses in patches at different moments and swells together, rather than the whole letter appearing at once. On release the stirring is boosted so the oil breaks up and spreads back out, and the volume regulator hands over to a fresh random pattern.
+- **Letters.** The oil is never faded in or out. It is pushed around by an invisible *mould*: a signed distance field (negative inside) whose outline the oil outside it is pushed toward, so the flow, merging and splitting are all the real simulation. Four stages:
+  1. **Gather.** The mould is one round blob and the push is strong. Every separate piece of oil flows toward it and coalesces. The engine looks at the oil every few frames (connected-component labelling) and the next stage does not start until it is a single compact piece that has stayed that way for a third of a second. Gaps are closed by the main mass growing into them, only inside the mould and only next to the main mass, so no new patch ever appears.
+  2. **Warp.** The mould's outline is blended, smoothly, from the blob into the letter (blending two signed distance fields gives a continuous in-between shape). A level offset is recomputed every frame so the mould's area always equals the oil's volume, so the oil fills it exactly. The letter is fixed in the viewer's frame, so it stays upright while the wheel turns.
+  3. **Hold** for 3 seconds.
+  4. **Release.** The outline is blended from the letter into a random 1 to 4 round blobs holding the same amount of oil, then the push fades and stirring is boosted so they drift apart.
+
+  Only the unified mass may grow or shrink, and only by a little (a volume regulator holds it to the mould's size). Pushing oil across the whole wheel is a very large-scale flow, so while a letter is up that layer gets a stiffer pressure solve (more iterations and almost no damping); with the normal one the flow stays slightly compressible and the oil visibly drains away.
 - **Frame-rate independence.** Per-step strengths are tuned at about 43 fps and scaled by frame time, so a slow GPU moves the same oil per second.
 
 ## Layout
