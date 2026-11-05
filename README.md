@@ -1,5 +1,7 @@
 # Oil Wheel
 
+**Try it: https://bsonej.github.io/oil-wheel/**
+
 A digital replica of the classic Mathmos Lava Lamp projector, intended to run on a round 6 inch transparent display. It runs in the browser, with no dependencies and no build step.
 
 It simulates what is inside a real oil-wheel projector: sealed glass layers, each holding a coloured oil and a clear carrier that never mix. The sandwich turns slowly in front of a lamp, so the oil sags, stretches and merges into an ever-changing pattern. Where layers overlap, their dyes multiply into another colour.
