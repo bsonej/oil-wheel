@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Oil Wheel</title>
+<link rel="stylesheet" href="src/style.css">
+</head>
+<body>
+<canvas id="lava" aria-label="Oil wheel projection"></canvas>
+<p id="note" class="note" hidden></p>
+
+<button id="show-panel" class="reveal" type="button" hidden>Controls</button>
+
+<aside id="panel" class="panel" aria-label="Controls">
+  <header>
+    <h1>Oil Wheel</h1>
+    <p>A digital replica of the classic Mathmos Lava Lamp projector. Intended to be run on a round 6 inch transparent display.</p>
+  </header>
+
+  <section>
+    <h2>Palette</h2>
+    <div id="presets" class="chips" role="group" aria-label="Palette presets"></div>
+    <div class="swatches">
+      <label><span>Oil A</span><input id="tone-a" type="color"></label>
+      <label><span>Oil B</span><input id="tone-b" type="color"></label>
+      <label id="oil-c-swatch"><span>Oil C</span><input id="tone-oil-c" type="color"></label>
+      <label><span>Carrier</span><input id="tone-c" type="color"></label>
+      <label><span>Lamp</span><input id="tone-lamp" type="color"></label>
+      <label><span>Wall</span><input id="tone-bg" type="color"></label>
+    </div>
+    <label class="toggle"><input id="third" type="checkbox"> <span>Third oil layer (Oil C)</span></label>
+  </section>
+
+  <section>
+    <h2>Motion</h2>
+    <label class="slider"><span>Flow &amp; rotation</span>
+      <input id="speed" type="range" min="10" max="250" value="100">
+    </label>
+    <div class="buttons">
+      <button id="reseed" type="button">New pour</button>
+      <button id="fullscreen" type="button">Fullscreen</button>
+      <button id="hide-panel" type="button">Hide</button>
+    </div>
+    <p class="hint">Keys: <kbd>H</kbd> hide controls · <kbd>F</kbd> fullscreen · <kbd>N</kbd> new pour · <kbd>T</kbd> third layer</p>
+  </section>
+</aside>
+
+<script type="module" src="src/app.js"></script>
+</body>
+</html>

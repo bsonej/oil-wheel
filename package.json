@@ -1,0 +1,14 @@
+{
+  "name": "oil-wheel",
+  "version": "0.1.0",
+  "description": "A photoreal liquid-wheel lava projector, simulated on the GPU in the browser.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
